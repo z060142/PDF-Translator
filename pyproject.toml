@@ -1,0 +1,22 @@
+[project]
+name = "pdf-translator"
+version = "0.1.0"
+description = "Layout-preserving PDF translator with LLM check-and-fix loop"
+authors = [
+    { name = "z060142", email = "z060142@yahoo.com.tw" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "anthropic>=2.3.0",
+    "fonttools>=4.68.0",
+    "openai>=3.42.0",
+    "pymupdf>=2.0",
+    "python-dotenv>=1.2.4",
+]
+
+[project.scripts]
+pdf-translator = "pdf_translator:main"
+
+[build-system]
+requires = ["uv_build>=0.13.5,<0.14.0"]
+build-backend = "uv_build"
