@@ -17,6 +17,7 @@ import pymupdf
 from .config import WORK_DIR, Settings, resolve_fonts
 from .llm import LLMClient, LLMError, Prompt, RetryableError, Usage
 from .layout_rules import learn, length_limits, summary, target_char_em, unit_fit
+from .markup import normalize_translation, plain, rules_for
 from .pdf_layout import FontPair, extract_units, render_document
 
 STATE_VERSION = 1
@@ -106,7 +107,7 @@ def load_state(path: Path) -> dict | None:
 
 
 def make_fonts(settings: Settings) -> FontPair:
-    return FontPair(*resolve_fonts(settings), settings.char_spacing)
+    return FontPair(*resolve_fonts(settings), settings.char_spacing, settings.inline_markup)
 
 
 def render_from_state(settings: Settings, state: dict, out_path: str) -> tuple[dict, dict]:
@@ -151,18 +152,20 @@ class DynamicLimiter:
             self.cond.notify_all()
 
 
-def _seg_lines(units: list[dict], field: str = "text") -> str:
-    return "\n".join(f"[{u['id']}] {u.get(field) or ''}" for u in units)
+def _seg_lines(units: list[dict], field: str = "text", as_plain: bool = False) -> str:
+    """Segment list; as_plain drops inline formatting markers (context / review only)."""
+    return "\n".join(f"[{u['id']}] {(plain(u, field) if as_plain else u.get(field)) or ''}" for u in units)
 
 
 def _by_batch(units: list[dict], field: str) -> str:
+    """Plain segment text grouped by translation batch (for the reviewer)."""
     out: list[str] = []
     batches: dict[int, list[dict]] = {}
     for u in units:
         batches.setdefault(u["batch"], []).append(u)
     for b, us in sorted(batches.items()):
         out.append(f"=== Batch {b} ({us[0]['id']}–{us[-1]['id']}) ===")
-        out.append(_seg_lines(us, field))
+        out.append(_seg_lines(us, field, as_plain=True))
     return "\n".join(out)
 
 
@@ -188,6 +191,11 @@ class Job:
         self._save_pending = False
         self._fatal_msgs: set[str] = set()
         self._tasks: list[asyncio.Task] = []
+        # set once the event loop accepts pause/resume/stop (used by the batch runner)
+        self.ready = threading.Event()
+        # outcome for the batch runner; status: done | partial | failed | stopped
+        self.result: dict = {"status": "failed", "output": settings.output_pdf, "message": "",
+                             "failed_pages": [], "warn_pages": []}
 
     # ============ thread-facing API (called from the UI thread) ============
     def start(self) -> None:
@@ -213,7 +221,7 @@ class Job:
             s = None
             if layout_settings is not None:
                 s = layout_settings.copy()
-                for k in ("input_pdf", "output_pdf", "page_range", "target_lang"):
+                for k in ("input_pdf", "output_pdf", "page_range", "target_lang", "inline_markup"):
                     setattr(s, k, getattr(self.settings, k))
             asyncio.run_coroutine_threadsafe(self._render("重新排版輸出", s), self.loop)
 
@@ -238,8 +246,10 @@ class Job:
             self.loop.run_until_complete(self._main())
         except Exception as e:  # pragma: no cover - last resort
             self.log(f"未預期錯誤: {e}\n{traceback.format_exc()}", "error")
+            self.result.update(status="failed", message=f"未預期錯誤: {e}")
             self.emit({"type": "state", "state": "error"})
         finally:
+            self.ready.set()
             try:
                 self.loop.run_until_complete(self._close_clients())
             finally:
@@ -255,7 +265,7 @@ class Job:
     def _do_resume(self, new_settings: Settings | None) -> None:
         if new_settings is not None:
             # document-level fields stay fixed during a job
-            for k in ("input_pdf", "output_pdf", "page_range", "target_lang"):
+            for k in ("input_pdf", "output_pdf", "page_range", "target_lang", "inline_markup"):
                 setattr(new_settings, k, getattr(self.settings, k))
             self.settings = new_settings
             self._clients.clear()          # rebuilt lazily with new model settings
@@ -316,9 +326,11 @@ class Job:
         self._rules: dict = {"scales": {}, "counts": {}, "ratio": None}
         self._rules_text = ""
         self._page_limiter = DynamicLimiter(lambda: self.settings.page_concurrency)
+        self.ready.set()
 
         if not s.input_pdf or not Path(s.input_pdf).exists():
             self.log("找不到輸入 PDF。", "error")
+            self.result["message"] = "找不到輸入 PDF"
             self.emit({"type": "state", "state": "finished"})
             return
         wd = work_dir_for(s.input_pdf, s.target_lang)
@@ -327,6 +339,7 @@ class Job:
         self.log_path = wd / "log.txt"
         out_path = s.output_pdf.strip() or default_output_path(s.input_pdf)
         self.settings.output_pdf = out_path
+        self.result["output"] = out_path
 
         doc = pymupdf.open(s.input_pdf)
         st = load_state(self.state_path)
@@ -340,11 +353,13 @@ class Job:
             pages = parse_page_range(s.page_range, doc.page_count)
         except ValueError:
             self.log(f"頁碼範圍格式錯誤: {s.page_range!r}", "error")
+            self.result["message"] = f"頁碼範圍格式錯誤: {s.page_range!r}"
             self.emit({"type": "state", "state": "finished"})
             return
         for pno in pages:
             if str(pno) not in st["pages"]:
-                st["pages"][str(pno)] = {"status": "pending", "units": extract_units(doc[pno]),
+                st["pages"][str(pno)] = {"status": "pending",
+                                         "units": extract_units(doc[pno], markup=s.inline_markup),
                                          "fix_rounds": 0, "warnings": [], "error": None}
         doc.close()
         self._relearn()
@@ -364,10 +379,11 @@ class Job:
         self._save(force=True)
 
         if self._stopping:
+            self.result.update(status="stopped", message="已停止（進度已保存）")
             self.emit({"type": "state", "state": "stopped"})
             return
         failed = [p + 1 for p in pages if st["pages"][str(p)]["status"] != "done"]
-        await self._render("輸出最終結果")
+        rendered = await self._render("輸出最終結果")
         if failed:
             self.log(f"完成，但以下頁面失敗（再按「開始」會重試）: {failed}", "warn")
         else:
@@ -375,9 +391,18 @@ class Job:
         warn_pages = [p + 1 for p in pages if st["pages"][str(p)].get("warnings")]
         if warn_pages:
             self.log(f"檢查未完全通過的頁面: {warn_pages}（詳見 log.txt）", "warn")
+        notes = []
+        if not rendered:
+            notes.append("輸出 PDF 失敗")
+        if failed:
+            notes.append(f"失敗頁 {failed}")
+        if warn_pages:
+            notes.append(f"檢查未通過頁 {warn_pages}")
+        self.result.update(status="failed" if not rendered else "partial" if failed else "done",
+                           message="；".join(notes), failed_pages=failed, warn_pages=warn_pages)
         self.emit({"type": "state", "state": "finished"})
 
-    async def _render(self, label: str, settings: Settings | None = None) -> None:
+    async def _render(self, label: str, settings: Settings | None = None) -> bool:
         settings = settings or self.settings
         out = settings.output_pdf
         try:
@@ -385,8 +410,10 @@ class Job:
             self.log(f"{label}: {out}（{layout_report(stats)}）")
             self.emit({"type": "rules", "text": summary(rules)})
             self.emit({"type": "output", "path": out})
+            return True
         except Exception as e:
             self.log(f"輸出 PDF 失敗: {e}", "error")
+            return False
 
     def _emit_progress(self) -> None:
         pages = self._pages
@@ -465,44 +492,73 @@ class Job:
     def _page_context(self, pno: int) -> str:
         units = self.state["pages"][str(pno)]["units"]
         return (f"<page number=\"{pno + 1}\" total=\"{self.state['page_count']}\">\n"
-                f"{_seg_lines(units)}\n</page>")
+                f"{_seg_lines(units, as_plain=True)}\n</page>")
 
-    def _apply_translations(self, units_by_id: dict, data: dict, wanted: set[str]) -> set[str]:
+    def _apply_translations(self, units_by_id: dict, data: dict, wanted: set[str],
+                            accept_bad_markup: bool) -> tuple[set[str], dict[str, list[str]]]:
+        """Store returned translations. Inline markers are validated against the source; a
+        translation with marker problems is kept back for a retry unless accept_bad_markup,
+        in which case its markers are repaired. Returns (missing ids, problems by id)."""
         got: set[str] = set()
+        problems: dict[str, list[str]] = {}
         for item in data.get("translations", []) or []:
             if not isinstance(item, dict):
                 continue
             uid = str(item.get("id", "")).strip().strip("[]")
             text = _ID_PREFIX.sub("", str(item.get("text", ""))).strip()
-            if uid in wanted and text:
-                units_by_id[uid]["translation"] = text
-                got.add(uid)
-        return wanted - got
+            if uid not in wanted or not text:
+                continue
+            u = units_by_id[uid]
+            fixed, probs = normalize_translation(u, text) if self.settings.inline_markup else (text, [])
+            if probs:
+                problems[uid] = probs
+                if not accept_bad_markup:
+                    continue
+            u["translation"] = fixed
+            got.add(uid)
+        return wanted - got, problems
 
     async def _translate_ids(self, pno: int, ids: list[str], task_header: str, label: str,
                              extra: str = "") -> list[str]:
         page = self.state["pages"][str(pno)]
         by_id = {u["id"]: u for u in page["units"]}
         missing = list(ids)
-        for _ in range(2):
+        feedback = ""
+        for attempt in range(2):
             segs = [by_id[i] for i in missing]
+            final = attempt == 1
 
-            def make_prompt(segs=segs) -> Prompt:
+            def make_prompt(segs=segs, feedback=feedback) -> Prompt:
                 task = (f"{task_header}\n{extra}"
-                        f"Segments to translate into {self.settings.target_lang}:\n{_seg_lines(segs)}\n\n"
+                        f"Segments to translate into {self.settings.target_lang}:\n"
+                        f"{_seg_lines(segs, as_plain=not self.settings.inline_markup)}\n\n"
+                        f"{self._markup_rules(segs)}{feedback}"
                         f"{self._limits_text(segs)}"
                         'Return JSON {"translations": [{"id": "S#", "text": "..."}]} containing exactly '
                         f"these ids: {', '.join(u['id'] for u in segs)}")
                 return Prompt(self._translator_system(), self._page_context(pno), task, TRANSLATION_SCHEMA)
 
             data = await self._call("translator", make_prompt, label)
-            missing = sorted(self._apply_translations(by_id, data, set(missing)),
-                             key=lambda x: int(x[1:]))
+            left, problems = self._apply_translations(by_id, data, set(missing), accept_bad_markup=final)
+            missing = sorted(left, key=lambda x: int(x[1:]))
             self._save()
+            if final and problems:
+                self.log(f"{label}: 格式標記仍不一致，已自動修正 "
+                         + "；".join(f"{k} {', '.join(v)}" for k, v in sorted(problems.items())), "warn")
             if not missing:
                 break
-            self.log(f"{label}: 缺少 {missing}，補翻中", "warn")
+            lacking = [m for m in missing if m not in problems]
+            if lacking:
+                self.log(f"{label}: 缺少 {lacking}，補翻中", "warn")
+            if problems:
+                self.log(f"{label}: 格式標記不一致，要求重新處理 {sorted(problems, key=lambda x: int(x[1:]))}", "warn")
+                feedback = ("Formatting problems in your previous answer - fix them:\n"
+                            + "\n".join(f"{k}: {'; '.join(v)}" for k, v in sorted(problems.items())) + "\n\n")
         return missing
+
+    def _markup_rules(self, segs: list[dict]) -> str:
+        """Marker rules for exactly the marker types used by these segments (empty if none)."""
+        return rules_for(segs) if self.settings.inline_markup else ""
 
     # ---------- learned layout rules ----------
     def _relearn(self) -> None:
@@ -533,13 +589,14 @@ class Job:
         units = [u for u in self.state["pages"][str(pno)]["units"]
                  if not u["skip"] and u.get("translation") and not u.get("shortened")
                  # short labels / untranslated text (overflow comes from font width) cannot be condensed
-                 and len(u["translation"]) >= 12 and u["translation"].strip() != u["text"].strip()
+                 and len(plain(u, "translation")) >= 12
+                 and plain(u, "translation").strip() != plain(u, "text").strip()
                  and u["pitch"] is not None]          # only multi-line paragraphs are rewritten
         over = []
         for u in units:
             f = unit_fit(u, self._fonts, lo, hi)
             if f < hi * 0.95:
-                limit = max(2, int(len(u["translation"]) * (f / hi) ** 2 * 0.95))
+                limit = max(2, int(len(plain(u, "translation")) * (f / hi) ** 2 * 0.95))
                 over.append((u, limit))
         if not over:
             return
@@ -551,8 +608,9 @@ class Job:
         def make_prompt() -> Prompt:
             task = (f"These translations on page {pno + 1} are too long to fit their space in the page layout "
                     "at the original font size. Rewrite each one more concisely within its character limit. "
-                    "Keep the complete meaning, all facts, numbers, names and markers; only tighten the wording."
-                    f"\n\n{segs_txt}\n\n"
+                    "Keep the complete meaning, all facts, numbers, names and markers; only tighten the wording. "
+                    "Character limits count visible text only, not formatting markers."
+                    f"\n\n{segs_txt}\n\n{self._markup_rules([u for u, _ in over])}"
                     'Return JSON {"translations": [{"id": "S#", "text": "..."}]} containing exactly these ids: '
                     + ", ".join(by_id))
             return Prompt(self._translator_system(), self._page_context(pno), task, TRANSLATION_SCHEMA)
@@ -564,8 +622,15 @@ class Job:
                 continue
             u = by_id.get(str(item.get("id", "")).strip().strip("[]"))
             text = _ID_PREFIX.sub("", str(item.get("text", ""))).strip()
+            if u is None or not text:
+                continue
+            if self.settings.inline_markup:
+                text, probs = normalize_translation(u, text)
+                if probs:                    # a rewrite that breaks the formatting is not worth it
+                    continue
             # accept only a real condensation, never one that drops most of the content
-            if u is not None and text and 0.5 * len(u["translation"]) <= len(text) < len(u["translation"]):
+            old, new = len(plain(u, "translation")), len(plain(dict(u, translation=text), "translation"))
+            if 0.5 * old <= new < old:
                 u["translation"] = text
                 shorter += 1
         for u, _ in over:

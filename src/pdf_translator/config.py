@@ -53,8 +53,9 @@ class Settings:
 
     batch_max_chars: int = 2500            # characters per translation batch
     batch_max_segments: int = 40
-    page_concurrency: int = 3              # pages processed at the same time
-    request_concurrency: int = 6           # simultaneous API requests (all roles)
+    file_concurrency: int = 1              # batch: books (PDF files) processed at the same time
+    page_concurrency: int = 3              # per book: pages processed at the same time
+    request_concurrency: int = 6           # per book: simultaneous API requests (all roles)
     max_retries: int = 3
 
     enable_check: bool = True
@@ -69,6 +70,14 @@ class Settings:
     char_spacing: float = 0.0              # extra letter spacing in em (negative = tighter)
     length_hints: bool = True              # tell the translator the space limit of tight segments
     shorten_overflow: bool = True          # ask for a concise rewrite of segments that overflow
+    inline_markup: bool = True             # carry inline styles through translation as Markdown markers
+
+    # batch mode (UI 批次 tab)
+    batch_files: list[str] = field(default_factory=list)
+    batch_output_dir: str = ""             # blank = next to each input
+    batch_suffix: str = "_translated"      # output name = <input name><suffix>.pdf
+    batch_recursive: bool = False          # include sub-folders when adding a folder
+    batch_skip_existing: bool = False      # skip files whose output already exists
 
     # ---- persistence ----
     def save(self, path: Path = CONFIG_PATH) -> None:

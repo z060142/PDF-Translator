@@ -1,22 +1,39 @@
-"""Headless runner: uv run python -m pdf_translator.cli input.pdf [--pages 1-3] [--no-check] [--relayout]"""
+"""Headless runner.
+
+    uv run python -m pdf_translator.cli input.pdf [-o out.pdf] [--pages 1-3] [--no-check] [--relayout]
+    uv run python -m pdf_translator.cli a.pdf b.pdf docs/ "scans/*.pdf" [--output-dir out/] [-r] [--skip-existing]
+        [--suffix _zh] [-j 3] [--page-concurrency 3] [--request-concurrency 6]
+"""
 from __future__ import annotations
 
 import argparse
 import queue
+import sys
 
 from dotenv import load_dotenv
 
+from .batch import Batch, BatchItem, check_suffix, collect_pdfs, plan_outputs
 from .config import APP_DIR, CONFIG_PATH, Settings
-from .layout_rules import summary
-from .pipeline import Job, default_output_path, layout_report, load_state, render_from_state, work_dir_for
 
 
 def main() -> None:
     load_dotenv(APP_DIR / ".env")
     ap = argparse.ArgumentParser(description="PDF translator (headless)")
-    ap.add_argument("input")
-    ap.add_argument("-o", "--output", default="")
-    ap.add_argument("--pages", default="")
+    ap.add_argument("inputs", nargs="+", help="PDF files, folders or wildcard patterns (batch when more than one PDF)")
+    ap.add_argument("-o", "--output", default="", help="output file (single input only)")
+    ap.add_argument("--output-dir", default="",
+                    help="output folder for <name><suffix>.pdf (default: next to each input)")
+    ap.add_argument("--suffix", default=None,
+                    help="output name suffix in batch mode (default: config.json, normally _translated); "
+                         "blank is allowed only with --output-dir")
+    ap.add_argument("-r", "--recursive", action="store_true", help="include sub-folders of folder inputs")
+    ap.add_argument("--skip-existing", action="store_true", help="skip files whose output already exists")
+    ap.add_argument("-j", "--book-concurrency", type=int, default=None,
+                    help="books (PDF files) translated at the same time")
+    ap.add_argument("--page-concurrency", type=int, default=None, help="pages at the same time, per book")
+    ap.add_argument("--request-concurrency", type=int, default=None,
+                    help="simultaneous API requests, per book")
+    ap.add_argument("--pages", default="", help="page range applied to every file, e.g. 1-5,8")
     ap.add_argument("--target", default=None)
     ap.add_argument("--no-check", action="store_true")
     ap.add_argument("--relayout", action="store_true",
@@ -28,32 +45,45 @@ def main() -> None:
     args = ap.parse_args()
 
     s = Settings.load(CONFIG_PATH)
-    s.input_pdf, s.output_pdf, s.page_range = args.input, args.output, args.pages
+    suffix = s.batch_suffix if args.suffix is None else args.suffix.strip()
+    if not args.output and (err := check_suffix(suffix, args.output_dir)):
+        ap.error(err)
+
+    pdfs, missing = collect_pdfs(args.inputs, args.recursive, suffix)
+    for m in missing:
+        print(f"找不到 PDF：{m}", file=sys.stderr)
+    if not pdfs:
+        sys.exit("沒有可處理的 PDF。")
+    if args.output and len(pdfs) > 1:
+        ap.error("-o/--output 只能用於單一輸入檔；多個檔案請用 --output-dir")
+
+    s.page_range = args.pages
     if args.target:
         s.target_lang = args.target
     if args.no_check:
         s.enable_check = False
     for attr, val in (("font_preset", args.font), ("char_spacing", args.spacing),
-                      ("min_font_scale", args.min_scale), ("max_font_scale", args.max_scale)):
+                      ("min_font_scale", args.min_scale), ("max_font_scale", args.max_scale),
+                      ("file_concurrency", args.book_concurrency), ("page_concurrency", args.page_concurrency),
+                      ("request_concurrency", args.request_concurrency)):
         if val is not None:
             setattr(s, attr, val)
 
-    if args.relayout:
-        st = load_state(work_dir_for(s.input_pdf, s.target_lang) / "state.json")
-        if not st:
-            print("找不到此檔（此目標語言）的翻譯進度。")
-            return
-        out = s.output_pdf or default_output_path(s.input_pdf)
-        rules, stats = render_from_state(s, st, out)
-        print("版面規則:", summary(rules))
-        print(f"已輸出：{out}（{layout_report(stats)}）")
-        return
+    outs = [args.output] if args.output else plan_outputs(pdfs, args.output_dir, suffix)
+    items = [BatchItem(i, o) for i, o in zip(pdfs, outs)]
 
     q: queue.Queue = queue.Queue()
-    job = Job(s, q.put)
-    job.start()
+    batch = Batch(s, items, q.put, relayout_only=args.relayout, skip_existing=args.skip_existing)
+    batch.start()
     while True:
-        ev = q.get()
+        try:
+            ev = q.get(timeout=0.5)
+        except queue.Empty:
+            continue
+        except KeyboardInterrupt:
+            print("中斷：停止中，進度會保存…", flush=True)
+            batch.stop()
+            continue
         if ev["type"] == "log":
             print(ev["msg"], flush=True)
         elif ev["type"] == "progress":
@@ -63,11 +93,15 @@ def main() -> None:
                   f"{u['checker']['output_tokens']}", flush=True)
         elif ev["type"] == "rules":
             print("  版面規則:", ev["text"], flush=True)
-        elif ev["type"] == "state" and ev["state"] in ("finished", "stopped", "error"):
+        elif ev["type"] == "state" and ev["state"] in ("finished", "stopped"):
             break
         elif ev["type"] == "state" and ev["state"] == "paused":
-            print("工作因錯誤暫停，CLI 模式下結束。", flush=True)
-            job.stop()
+            # only setting errors pause in CLI mode; they would fail every remaining file too
+            print("工作因設定錯誤暫停，CLI 模式下停止批次。", flush=True)
+            batch.stop()
+    if batch.thread:
+        batch.thread.join()
+    sys.exit(0 if all(it.status in ("done", "skipped") for it in items) else 1)
 
 
 if __name__ == "__main__":

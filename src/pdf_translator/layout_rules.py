@@ -14,7 +14,8 @@ import statistics
 from collections import defaultdict
 from typing import Iterable
 
-from .pdf_layout import FontPair, capacity_chars, fit_scale, style_key
+from .markup import plain
+from .pdf_layout import FontPair, capacity_chars, fit_scale, prepare, style_key
 
 CLASS_PERCENTILE = 0.2      # 80% of a class fits at the class scale without extra shrinking
 MIN_RATIO_SAMPLES = 10
@@ -39,9 +40,11 @@ def _percentile(vals: list[float], p: float) -> float:
 def unit_fit(u: dict, fonts: FontPair, lo: float, hi: float) -> float:
     """Fit scale of a translated unit, cached in the unit (invalidated by text/font/limits)."""
     text = u["translation"].strip()
-    key = hashlib.md5(f"{fonts.signature}|{lo:.3f}|{hi:.3f}|{text}".encode("utf-8")).hexdigest()[:16]
+    marks = ",".join(u.get("marks") or ())
+    key = hashlib.md5(f"{fonts.signature}|{lo:.3f}|{hi:.3f}|{marks}|{u.get('italic')}|{text}"
+                      .encode("utf-8")).hexdigest()[:16]
     if u.get("fit_key") != key:
-        u["fit"] = round(fit_scale(u, text, fonts.font_for(u), lo, hi, fonts.spacing), 4)
+        u["fit"] = round(fit_scale(u, prepare(u, text, fonts), lo, hi, fonts.spacing), 4)
         u["fit_key"] = key
     return u["fit"]
 
@@ -54,8 +57,9 @@ def learn(units_lists: Iterable[list[dict]], fonts: FontPair, min_scale: float, 
             if u.get("skip") or not u.get("translation"):
                 continue
             samples[style_key(u)].append(unit_fit(u, fonts, min_scale, max_scale))
-            if len(u["text"]) >= 8:
-                ratios.append(len(u["translation"]) / len(u["text"]))
+            src = len(plain(u, "text"))
+            if src >= 8:
+                ratios.append(len(plain(u, "translation")) / src)
     scales = {k: round(max(min_scale, min(max_scale, _percentile(v, CLASS_PERCENTILE))), 3)
               for k, v in samples.items()}
     return {
@@ -74,10 +78,11 @@ def length_limits(units: list[dict], rules: dict, max_scale: float, char_em: flo
     ratio = rules.get("ratio") or 1.0
     limits: dict[str, int] = {}
     for u in units:
-        if len(u["text"]) < 20 or u["pitch"] is None:   # single lines hug the text, a limit would mislead
+        src = len(plain(u, "text"))
+        if src < 20 or u["pitch"] is None:   # single lines hug the text, a limit would mislead
             continue
         cap = capacity_chars(u, max_scale, char_em)
-        expected = len(u["translation"]) if (use_current and u.get("translation")) else ratio * len(u["text"])
+        expected = len(plain(u, "translation")) if (use_current and u.get("translation")) else ratio * src
         if expected > 0.8 * cap:
             limits[u["id"]] = cap
     return limits

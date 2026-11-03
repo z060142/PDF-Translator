@@ -14,6 +14,7 @@ from tkinter.scrolledtext import ScrolledText
 
 from dotenv import load_dotenv
 
+from .batch import STATUS_LABELS, Batch, BatchItem, check_suffix, collect_pdfs, output_name, plan_outputs
 from .config import (ANTHROPIC_EFFORTS, APP_DIR, CONFIG_PATH, FONT_PRESETS, OPENAI_EFFORTS, Settings,
                      resolve_fonts)
 from .layout_rules import summary
@@ -122,7 +123,9 @@ class ModelFrame(ttk.Frame):
 class App:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.job: Job | None = None
+        self.job: Job | Batch | None = None
+        self.batch_files: list[str] = []
+        self._last_output = ""
         self.events: queue.Queue = queue.Queue()
         self.settings = Settings.load(CONFIG_PATH)
         root.title("PDF 翻譯器")
@@ -140,11 +143,14 @@ class App:
             "input_pdf": tk.StringVar(), "output_pdf": tk.StringVar(), "page_range": tk.StringVar(),
             "source_lang": tk.StringVar(), "target_lang": tk.StringVar(),
             "batch_max_chars": tk.IntVar(), "batch_max_segments": tk.IntVar(),
+            "file_concurrency": tk.IntVar(),
             "page_concurrency": tk.IntVar(), "request_concurrency": tk.IntVar(), "max_retries": tk.IntVar(),
             "enable_check": tk.BooleanVar(), "max_check_rounds": tk.IntVar(), "check_with_reason": tk.BooleanVar(),
             "font_preset": tk.StringVar(), "font_regular": tk.StringVar(), "font_bold": tk.StringVar(),
             "min_font_scale": tk.DoubleVar(), "max_font_scale": tk.DoubleVar(), "char_spacing": tk.DoubleVar(),
-            "length_hints": tk.BooleanVar(), "shorten_overflow": tk.BooleanVar(),
+            "length_hints": tk.BooleanVar(), "shorten_overflow": tk.BooleanVar(), "inline_markup": tk.BooleanVar(),
+            "batch_output_dir": tk.StringVar(), "batch_suffix": tk.StringVar(), "batch_recursive": tk.BooleanVar(),
+            "batch_skip_existing": tk.BooleanVar(),
         }
         nb = ttk.Notebook(self.root)
         nb.pack(fill="x", padx=8, pady=(8, 4))
@@ -191,6 +197,65 @@ class App:
         self.setting_widgets.append(self.txt_extra)
         g.columnconfigure(1, weight=1)
 
+        # --- batch tab ---
+        bt = ttk.Frame(nb, padding=10)
+        nb.add(bt, text="批次")
+        tf = ttk.Frame(bt)
+        tf.grid(row=0, column=0, columnspan=3, sticky="nsew")
+        self.tree = ttk.Treeview(tf, columns=("file", "status", "info"), show="headings", height=6,
+                                 selectmode="extended")
+        for col, text, width, stretch in (("file", "檔案", 380, True), ("status", "狀態", 80, False),
+                                          ("info", "結果 / 輸出", 380, True)):
+            self.tree.heading(col, text=text)
+            self.tree.column(col, width=width, stretch=stretch)
+        sb = ttk.Scrollbar(tf, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        sb.pack(side="left", fill="y")
+        bf = ttk.Frame(bt)
+        bf.grid(row=1, column=0, columnspan=3, sticky="w", pady=(4, 2))
+        for text, cmd in (("加入檔案…", self._batch_add_files), ("加入資料夾…", self._batch_add_folder),
+                          ("移除選取", self._batch_remove), ("清空", self._batch_clear)):
+            b = ttk.Button(bf, text=text, command=cmd)
+            b.pack(side="left", padx=(0, 4))
+            self.doc_widgets.append(b)
+        ck = ttk.Checkbutton(bf, text="加入資料夾時包含子資料夾", variable=self.v["batch_recursive"])
+        ck.pack(side="left", padx=8)
+        self.doc_widgets.append(ck)
+        ttk.Label(bt, text="輸出資料夾").grid(row=2, column=0, sticky="w")
+        e = ttk.Entry(bt, textvariable=self.v["batch_output_dir"], width=60)
+        e.grid(row=2, column=1, sticky="we", pady=2)
+        b = ttk.Button(bt, text="瀏覽…", command=self._browse_batch_dir)
+        b.grid(row=2, column=2, padx=4)
+        self.doc_widgets += [e, b]
+        ttk.Label(bt, text="輸出檔名後綴").grid(row=3, column=0, sticky="w")
+        sf = ttk.Frame(bt)
+        sf.grid(row=3, column=1, columnspan=2, sticky="we", pady=2)
+        e = ttk.Entry(sf, textvariable=self.v["batch_suffix"], width=20)
+        e.pack(side="left")
+        self.doc_widgets.append(e)
+        self.lbl_suffix = ttk.Label(sf, text="", foreground="#666")
+        self.lbl_suffix.pack(side="left", padx=8)
+        self.v["batch_suffix"].trace_add("write", lambda *a: self._update_suffix_label())
+        self.v["batch_output_dir"].trace_add("write", lambda *a: self._update_suffix_label())
+        ck = ttk.Checkbutton(bt, text="略過已有輸出檔的檔案", variable=self.v["batch_skip_existing"])
+        ck.grid(row=4, column=0, columnspan=2, sticky="w", pady=2)
+        self.doc_widgets.append(ck)
+        bf2 = ttk.Frame(bt)
+        bf2.grid(row=5, column=0, columnspan=3, sticky="w", pady=(4, 0))
+        self.btn_batch = ttk.Button(bf2, text="開始批次翻譯 / 恢復", command=lambda: self._start_batch(False))
+        self.btn_batch_render = ttk.Button(bf2, text="批次重新排版輸出（不翻譯）",
+                                           command=lambda: self._start_batch(True))
+        self.btn_batch.pack(side="left", padx=(0, 4))
+        self.btn_batch_render.pack(side="left", padx=4)
+        ttk.Label(bt, text="同時處理的書本數在「流程 / 併發」分頁設定（與每本書內的頁數、請求數分開）。"
+                           "每個檔案各自保存進度，中斷後再按「開始批次翻譯」會從中斷處繼續。"
+                           "目標語言、頁碼範圍、模型與排版設定沿用其他分頁；暫停 / 繼續 / 停止作用於所有處理中的書。",
+                  foreground="#666", wraplength=760, justify="left").grid(row=6, column=0, columnspan=3,
+                                                                          sticky="w", pady=(6, 0))
+        self.doc_widgets += [self.btn_batch, self.btn_batch_render]
+        bt.columnconfigure(1, weight=1)
+
         # --- model tabs ---
         self.mf_trans = ModelFrame(nb, "翻譯模型")
         nb.add(self.mf_trans, text="翻譯模型")
@@ -202,8 +267,9 @@ class App:
         w = ttk.Frame(nb, padding=10)
         nb.add(w, text="流程 / 併發")
         rows = [
-            ("同時處理頁數", "page_concurrency", 1, 64, 1),
-            ("最大並發請求數（全部角色合計）", "request_concurrency", 1, 128, 1),
+            ("同時處理書本數（批次）", "file_concurrency", 1, 32, 1),
+            ("每本書同時處理頁數", "page_concurrency", 1, 64, 1),
+            ("每本書最大並發請求數（翻譯＋檢查合計）", "request_concurrency", 1, 128, 1),
             ("每批最大字元數", "batch_max_chars", 200, 20000, 100),
             ("每批最多段落數", "batch_max_segments", 1, 500, 1),
             ("單一請求最多重試次數", "max_retries", 1, 20, 1),
@@ -221,8 +287,11 @@ class App:
         ck2 = ttk.Checkbutton(w, text="檢查結果附簡短原因（關閉則只輸出 是/否 + 否決區間）",
                               variable=self.v["check_with_reason"])
         ck2.grid(row=i + 1, column=0, columnspan=2, sticky="w", pady=2)
-        ttk.Label(w, text="暫停後可修改這裡與模型設定，按「繼續」立即套用。",
-                  foreground="#666").grid(row=i + 2, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        ttk.Label(w, text="暫停後可修改這裡與模型設定，按「繼續」立即套用。\n"
+                          "批次並行時，總請求數最多為「同時處理書本數 × 每本書最大並發請求數」；"
+                          "遇到速率限制（429）時先調低書本數。",
+                  foreground="#666", justify="left").grid(row=i + 2, column=0, columnspan=2, sticky="w",
+                                                         pady=(10, 0))
         self.setting_widgets += [ck, ck2]
 
         # --- layout tab ---
@@ -260,11 +329,16 @@ class App:
         ck2 = ttk.Checkbutton(t, text="譯文超出原版面時，先要求翻譯模型精簡（每段最多一次，在檢查之前）",
                               variable=self.v["shorten_overflow"])
         ck2.grid(row=8, column=0, columnspan=3, sticky="w", pady=2)
+        ck3 = ttk.Checkbutton(t, text="保留行內格式：粗體、斜體、底線、刪除線、螢光標記、上下標以 Markdown 標記送給翻譯模型，"
+                                      "譯文須保留相同標記（翻譯中不可更改；關閉時重新排版會輸出純文字）",
+                              variable=self.v["inline_markup"])
+        ck3.grid(row=9, column=0, columnspan=3, sticky="w", pady=2)
+        self.doc_widgets.append(ck3)
         ttk.Label(t, text="同一樣式（原字級＋粗細）的文字在全文件使用同一縮放比例，由已翻譯的頁面自動學習；"
                           "輸出時以全文件規則重新排版，各頁字級一致。\n"
                           "翻譯完成後若只想改字型、字距或縮放：修改本頁設定後按「重新排版輸出」，"
                           "會用已保存的譯文重新學習規則並輸出，不呼叫 API。暫停中也可以先按它預覽。",
-                  foreground="#666", wraplength=760, justify="left").grid(row=9, column=0, columnspan=3,
+                  foreground="#666", wraplength=760, justify="left").grid(row=10, column=0, columnspan=3,
                                                                           sticky="w", pady=(6, 0))
         self.setting_widgets += [ck1, ck2]
         t.columnconfigure(1, weight=1)
@@ -307,6 +381,8 @@ class App:
         self.txt_extra.insert("1.0", s.extra_instructions)
         self.mf_trans.load(s.translator)
         self.mf_check.load(s.checker)
+        self.batch_files = [p for p in s.batch_files if isinstance(p, str)]
+        self._refresh_batch_tree()
         self._update_font_label()
 
     def _collect(self) -> Settings:
@@ -319,6 +395,7 @@ class App:
         s.extra_instructions = self.txt_extra.get("1.0", "end").strip()
         self.mf_trans.dump(s.translator)
         self.mf_check.dump(s.checker)
+        s.batch_files = list(self.batch_files)
         self.settings = s
         try:
             s.save(CONFIG_PATH)
@@ -379,7 +456,90 @@ class App:
             s.output_pdf = default_output_path(s.input_pdf)
             self.v["output_pdf"].set(s.output_pdf)
         self._append_log(f"開始：{s.input_pdf}")
+        self._batch_text = ""
         self.job = Job(s, self.events.put)
+        self.job.start()
+        self._set_mode("running")
+
+    # ---- batch ----
+    def _refresh_batch_tree(self) -> None:
+        self.tree.delete(*self.tree.get_children())
+        for i, p in enumerate(self.batch_files):
+            self.tree.insert("", "end", iid=str(i), values=(p, STATUS_LABELS["pending"], ""))
+        self._update_suffix_label()
+
+    def _update_suffix_label(self) -> None:
+        suffix, out_dir = self.v["batch_suffix"].get().strip(), self.v["batch_output_dir"].get()
+        err = check_suffix(suffix, out_dir)
+        if err:
+            self.lbl_suffix.config(text=err, foreground="#c33")
+            return
+        sample = Path(self.batch_files[0]).name if self.batch_files else "book.pdf"
+        where = "輸出資料夾" if out_dir.strip() else "原檔資料夾"
+        self.lbl_suffix.config(text=f"例：{sample} → {where}/{output_name(sample, suffix)}", foreground="#666")
+
+    def _batch_add(self, paths: list[str], recursive: bool = False) -> None:
+        pdfs, _ = collect_pdfs(paths, recursive, self.v["batch_suffix"].get().strip())
+        known = {str(Path(p).resolve()).lower() for p in self.batch_files}
+        new = [p for p in pdfs if str(Path(p).resolve()).lower() not in known]
+        self.batch_files += new
+        self._refresh_batch_tree()
+        self._collect()
+        if not new:
+            self._append_log("沒有新增任何 PDF（已在清單中，或資料夾內沒有 PDF；檔名以輸出後綴或 _translated "
+                             "結尾的檔案會被視為先前的輸出而略過）。", "warn")
+
+    def _batch_add_files(self) -> None:
+        ps = filedialog.askopenfilenames(filetypes=[("PDF", "*.pdf")])
+        if ps:
+            self._batch_add(list(ps))
+
+    def _batch_add_folder(self) -> None:
+        d = filedialog.askdirectory()
+        if d:
+            self._batch_add([d], self.v["batch_recursive"].get())
+
+    def _batch_remove(self) -> None:
+        drop = {int(i) for i in self.tree.selection()}
+        self.batch_files = [p for i, p in enumerate(self.batch_files) if i not in drop]
+        self._refresh_batch_tree()
+        self._collect()
+
+    def _batch_clear(self) -> None:
+        self.batch_files = []
+        self._refresh_batch_tree()
+        self._collect()
+
+    def _browse_batch_dir(self) -> None:
+        d = filedialog.askdirectory()
+        if d:
+            self.v["batch_output_dir"].set(d)
+
+    def _start_batch(self, relayout: bool) -> None:
+        s = self._collect()
+        if not self.batch_files:
+            messagebox.showerror("錯誤", "請先在「批次」分頁加入要處理的 PDF")
+            return
+        s.batch_suffix = s.batch_suffix.strip()
+        err = check_suffix(s.batch_suffix, s.batch_output_dir)
+        if err:
+            messagebox.showerror("錯誤", err)
+            return
+        missing = [p for p in self.batch_files if not Path(p).is_file()]
+        for p in missing:
+            self._append_log(f"找不到檔案，略過：{p}", "warn")
+        pdfs = [p for p in self.batch_files if Path(p).is_file()]
+        if not pdfs:
+            return
+        if not relayout and s.page_range.strip() and not messagebox.askyesno(
+                "確認", f"頁碼範圍「{s.page_range}」會套用到每一個檔案。確定要開始？"):
+            return
+        self.batch_files = pdfs
+        self._refresh_batch_tree()
+        self._collect()
+        items = [BatchItem(i, o) for i, o in zip(pdfs, plan_outputs(pdfs, s.batch_output_dir, s.batch_suffix))]
+        self._batch_text = ""
+        self.job = Batch(s, items, self.events.put, relayout_only=relayout, skip_existing=s.batch_skip_existing)
         self.job.start()
         self._set_mode("running")
 
@@ -434,7 +594,7 @@ class App:
             self._append_log("已清除進度。")
 
     def _open_output_dir(self) -> None:
-        out = self.v["output_pdf"].get().strip()
+        out = self._last_output or self.v["output_pdf"].get().strip()
         d = Path(out).parent if out else APP_DIR
         if not d.exists():
             return
@@ -470,6 +630,19 @@ class App:
                     self._refresh_status()
                 elif t == "rules":
                     self.lbl_rules.config(text="版面規則（學習中）：" + ev["text"])
+                elif t == "output":
+                    self._last_output = ev["path"]
+                elif t == "batch":
+                    it = ev["item"]
+                    iid = str(ev["index"])
+                    if self.tree.exists(iid):
+                        info = it["message"] or (it["output_pdf"] if it["status"] != "running" else "")
+                        self.tree.item(iid, values=(it["input_pdf"], STATUS_LABELS[it["status"]], info))
+                        if it["status"] == "running":
+                            self.tree.see(iid)
+                    self._batch_text = (f"批次 {ev['finished']}/{ev['total']} 本已結束"
+                                        + (f"，{ev['running']} 本處理中" if ev["running"] else ""))
+                    self._refresh_status()
                 elif t == "state":
                     st = ev["state"]
                     if st == "running":
@@ -487,7 +660,8 @@ class App:
         self.root.after(100, self._poll)
 
     def _refresh_status(self) -> None:
-        parts = [getattr(self, "_state_text", ""), getattr(self, "_progress_text", "")]
+        parts = [getattr(self, "_state_text", ""), getattr(self, "_batch_text", ""),
+                 getattr(self, "_progress_text", "")]
         self.lbl_status.config(text="　".join(p for p in parts if p))
 
     def _on_close(self) -> None:
