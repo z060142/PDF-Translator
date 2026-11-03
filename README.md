@@ -27,6 +27,31 @@
   - 進度條和 token 用量顯示整批合計；log 每行會標示 `[序號/總數 檔名]`。
 - **中斷恢復**：每段翻譯都即時存進 `work/<檔名>_<hash>_<語言>/state.json`。停止、當機或關閉程式後，再按「開始」會從中斷處繼續。
 - **多步驟翻譯檢查**：一頁翻完後，由獨立的檢查模型模糊比對全頁原文和全頁譯文，只檢查有沒有跑題、錯譯、漏譯。檢查模型只回答通過與否，加上被否決的段落區間（標註所屬批次）。被否決的區間會連同全頁原文退回翻譯模型，要求只修復該段，修完再重新檢查，最多重複「最多修復輪數」次。
+- **Anthropic 提示快取**：每個請求依穩定程度分層，每層結尾放一個快取斷點：系統提示（整份文件、批次中的每本書共用）→ 整頁原文（同一頁的所有批次、精簡、修復請求共用）→ 該次任務（不快取）。
+  - 只在會被重複讀取時才寫入：快取寫入要付 1.25 倍（1 小時 TTL 為 2 倍），讀取約 0.1 倍（Opus 5.5 為 0.05 倍）。所以只有預期有 2 個以上請求共用、或已經在快取中的整頁原文才會標記。只檢查一次的頁面不會寫入快取。
+  - 避免平行重複寫入：快取要等寫入它的回應開始串流後才讀得到。同一頁的多個批次會先讓一個請求寫入，其餘等它開始回應後再送出、直接讀取。已確定在快取中的層（依 TTL 追蹤，每次讀取會延長）不會等待；太短而無法快取的層（低於模型最小長度）也不會等待。
+  - UI 狀態列與 log 會顯示快取讀取／寫入量，以及依各模型價格算出的輸入成本節省比例。
+  - OpenAI 相容服務套用同樣的分層與規則（穩定內容在前、只寫入會被讀回的內容、第一個請求先寫入快取），並依 Base URL 與模型自動選擇做法：
+
+    | 服務 / 模型 | 斷點寫法 | 路由 | 價格（相對一般輸入） |
+    |---|---|---|---|
+    | OpenAI GPT-5.6 以後 | `prompt_cache_breakpoint` 加上 `prompt_cache_options` 的 explicit 模式（不在每次不同的結尾自動寫入） | `prompt_cache_key`（每頁一個） | 寫入 1.25 倍，讀取 0.1 倍 |
+    | OpenAI 較舊模型 | 自動 | `prompt_cache_key` | 寫入免費，讀取 0.1–0.5 倍 |
+    | OpenRouter → Claude / Qwen | `cache_control` | `session_id`（整個工作固定在同一供應商） | 依原廠 |
+    | OpenRouter → OpenAI GPT-5.6 以後 | `prompt_cache_breakpoint` | `session_id` | 依原廠 |
+    | OpenRouter → 其他（Gemini、DeepSeek、Grok…） | 自動 | `session_id` | 依原廠 |
+    | DeepSeek | 自動（磁碟快取） | – | 讀取約 0.1 倍 |
+    | 其他（vLLM、Ollama…） | 不送任何快取參數 | – | 有回報時才統計 |
+
+  - OpenAI 與 OpenRouter 需要協調快取時會改用串流，等第一個 token 回來就讓其他請求送出。
+  - 端點不接受快取參數或串流時，會自動改為不帶這些參數送出，並在 log 提示。
+  - OpenAI 相容服務的節省比例依各家公開價格估算，僅供參考。
+  - 一個請求涵蓋整頁時（頁面只有一批），不再另外附上整頁原文，因為要翻譯的段落本身就是整頁。只有部分段落的請求（多批次頁面、修復）才附上整頁原文作為上下文。實測同樣 16 頁，翻譯輸入費用少 53%，總費用少 20%。
+- **批次模式（Message Batches，半價）**：在「流程 / 併發」分頁把「Anthropic 呼叫方式」設為 `batch`（命令列 `--api batch`），Anthropic 請求就以 Message Batches API 送出，所有 token 都是 5 折。
+  - 每一輪（翻譯、精簡、檢查、修復）會把全部頁面的請求合成一批送出，等整批結束後再進行下一輪。結果通常在一小時內回來（最長 24 小時），所以不適合需要即時看到結果的情況。
+  - 批次模式下不受「同時處理頁數」和「最大並發請求數」限制，全文件一起排入同一批。
+  - 提示快取自動使用 1 小時 TTL，因為批次內的請求順序不固定，處理時間也可能超過 5 分鐘。
+  - 不支援伺服器端備援模型（Batches API 不接受 `fallbacks`）。停止工作時會取消尚未完成的批次，未處理的請求不收費；已完成頁面的進度照常保存。
 - **模型分開設定**：翻譯和檢查可以使用不同供應商、模型與思考努力程度。
   - `anthropic`：Claude（預設翻譯 `claude-opus-5-5`、檢查 `claude-sonnet-5-5`），思考程度 `low`～`max`。
   - `openai`：任何相容 OpenAI Chat Completions 的服務，填 Base URL 即可（OpenAI、DeepSeek、OpenRouter、本地 vLLM/Ollama 等），思考程度會以 `reasoning_effort` 傳送。
@@ -80,6 +105,7 @@ uv run python -m pdf_translator.cli 輸入.pdf -o 輸出.pdf --relayout [--font 
 ```
 uv run python -m pdf_translator.cli a.pdf b.pdf 資料夾/ "其他/*.pdf" [--output-dir 輸出資料夾] [-r] [--skip-existing] [--relayout]
     [--suffix 後綴] [-j 同時處理書本數] [--page-concurrency 每本書頁數] [--request-concurrency 每本書請求數]
+    [--cache 5m|1h|off] [--api realtime|batch]
 ```
 
 - `-j` 未指定時使用 `config.json` 的設定（預設 1，也就是一本一本處理）。
@@ -110,6 +136,8 @@ uv run python -m pdf_translator.cli a.pdf b.pdf 資料夾/ "其他/*.pdf" [--out
 | 設定 | 說明 |
 |---|---|
 | 每批最大字元數 / 段落數 | 一頁內的段落會切成多批送出，每批都附上全頁原文作為上下文（Claude 會快取這部分）。 |
+| Anthropic 提示快取 | `5m`（預設）：連續翻譯時最省，每次讀取都會延長。`1h`：經常暫停超過 5 分鐘時使用，寫入較貴（2 倍），但暫停後仍能讀到。`off`：關閉。 |
+| Anthropic 呼叫方式 | `realtime`（預設）：串流、即時。`batch`：Message Batches 半價，每輪結果通常一小時內回來。 |
 | 同時處理書本數 | 批次時同時翻譯幾本書（PDF 檔），預設 1。和下面兩項分開設定。 |
 | 每本書同時處理頁數 / 每本書最大並發請求數 | 每本書各自的上限。批次並行時，總請求數最多為「書本數 × 每本書請求數」。遇到速率限制（429）時先調低書本數；程式會自動退避重試。 |
 | 最多修復輪數 | 檢查否決後最多修復幾輪，達上限仍被否決的頁面會記錄在 log。 |
@@ -130,6 +158,9 @@ src/pdf_translator/
   pipeline.py    工作流程：併發、暫停、中斷恢復、檢查與修復
   batch.py       批次處理：多檔依序執行、輸出路徑規劃
   llm.py         Anthropic / OpenAI 相容 API 呼叫
+  prompt_cache.py  Anthropic 提示快取：分層斷點、依需求寫入、避免平行重複寫入的排程
+  msgbatch.py    批次模式：把請求收集成 Message Batches 送出並分發結果
+  oa_cache.py    OpenAI 相容服務的快取：依服務與模型選擇斷點寫法、路由鍵與價格
   pdf_layout.py  段落抽取與譯文排版（含行內格式的抽取與繪製）
   markup.py      行內格式的 Markdown 標記：允許清單、解析、驗證、動態規則
   config.py      設定與字型

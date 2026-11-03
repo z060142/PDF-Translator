@@ -33,6 +33,10 @@ def main() -> None:
     ap.add_argument("--page-concurrency", type=int, default=None, help="pages at the same time, per book")
     ap.add_argument("--request-concurrency", type=int, default=None,
                     help="simultaneous API requests, per book")
+    ap.add_argument("--cache", choices=["5m", "1h", "off"], default=None,
+                    help="Anthropic prompt caching TTL (default: config.json, normally 5m)")
+    ap.add_argument("--api", choices=["realtime", "batch"], default=None,
+                    help="Anthropic call mode: realtime streaming, or Message Batches at 50%% price (slower)")
     ap.add_argument("--pages", default="", help="page range applied to every file, e.g. 1-5,8")
     ap.add_argument("--target", default=None)
     ap.add_argument("--no-check", action="store_true")
@@ -65,7 +69,8 @@ def main() -> None:
     for attr, val in (("font_preset", args.font), ("char_spacing", args.spacing),
                       ("min_font_scale", args.min_scale), ("max_font_scale", args.max_scale),
                       ("file_concurrency", args.book_concurrency), ("page_concurrency", args.page_concurrency),
-                      ("request_concurrency", args.request_concurrency)):
+                      ("request_concurrency", args.request_concurrency), ("prompt_cache", args.cache),
+                      ("api_mode", args.api)):
         if val is not None:
             setattr(s, attr, val)
 
@@ -88,9 +93,11 @@ def main() -> None:
             print(ev["msg"], flush=True)
         elif ev["type"] == "progress":
             u = ev["usage"]
-            print(f"  進度 {ev['done']}/{ev['total']}  tokens 翻譯 {u['translator']['input_tokens']}/"
-                  f"{u['translator']['output_tokens']}  檢查 {u['checker']['input_tokens']}/"
-                  f"{u['checker']['output_tokens']}", flush=True)
+            tr, ck = u["translator"], u["checker"]
+            print(f"  進度 {ev['done']}/{ev['total']}  tokens 翻譯 輸入 {tr['input_tokens']}"
+                  f"（快取讀 {tr['cache_read_tokens']}）/輸出 {tr['output_tokens']}"
+                  f"  檢查 輸入 {ck['input_tokens']}（快取讀 {ck['cache_read_tokens']}）/輸出 {ck['output_tokens']}",
+                  flush=True)
         elif ev["type"] == "rules":
             print("  版面規則:", ev["text"], flush=True)
         elif ev["type"] == "state" and ev["state"] in ("finished", "stopped"):

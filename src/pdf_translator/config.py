@@ -57,6 +57,8 @@ class Settings:
     page_concurrency: int = 3              # per book: pages processed at the same time
     request_concurrency: int = 6           # per book: simultaneous API requests (all roles)
     max_retries: int = 3
+    prompt_cache: str = "5m"               # Anthropic prompt caching TTL: "5m" | "1h" | "off"
+    api_mode: str = "realtime"             # Anthropic: "realtime" (streaming) | "batch" (Message Batches, 50%)
 
     enable_check: bool = True
     max_check_rounds: int = 2              # fix-and-recheck rounds per page

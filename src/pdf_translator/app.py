@@ -18,12 +18,22 @@ from .batch import STATUS_LABELS, Batch, BatchItem, check_suffix, collect_pdfs, 
 from .config import (ANTHROPIC_EFFORTS, APP_DIR, CONFIG_PATH, FONT_PRESETS, OPENAI_EFFORTS, Settings,
                      resolve_fonts)
 from .layout_rules import summary
+from .llm import cache_saving
 from .pipeline import Job, default_output_path, layout_report, load_state, render_from_state, work_dir_for
 
 ANTHROPIC_MODELS = ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5", "claude-fable-5-1", "claude-opus-5"]
 OPENAI_MODELS = ["gpt-5", "gpt-5-mini", "deepseek-chat", "qwen-plus"]
 SOURCE_LANGS = ["自動偵測", "English", "한국어", "日本語", "简体中文", "Deutsch", "Français", "Español"]
 TARGET_LANGS = ["繁體中文（台灣）", "简体中文", "English", "日本語", "한국어"]
+
+
+def _usage_text(u: dict) -> str:
+    text = (f"{u['requests']} 次請求，輸入 {u['input_tokens']:,}"
+            f"（快取讀 {u['cache_read_tokens']:,} / 寫 {u.get('cache_write_tokens', 0):,}）"
+            f" / 輸出 {u['output_tokens']:,} tokens")
+    saving = cache_saving(u)
+    text += f"，快取省 {saving:.0%} 輸入成本" if saving is not None else ""
+    return text + (f"，批次 5 折 {u['batch_requests']} 次" if u.get("batch_requests") else "")
 
 
 class ModelFrame(ttk.Frame):
@@ -145,6 +155,7 @@ class App:
             "batch_max_chars": tk.IntVar(), "batch_max_segments": tk.IntVar(),
             "file_concurrency": tk.IntVar(),
             "page_concurrency": tk.IntVar(), "request_concurrency": tk.IntVar(), "max_retries": tk.IntVar(),
+            "prompt_cache": tk.StringVar(), "api_mode": tk.StringVar(),
             "enable_check": tk.BooleanVar(), "max_check_rounds": tk.IntVar(), "check_with_reason": tk.BooleanVar(),
             "font_preset": tk.StringVar(), "font_regular": tk.StringVar(), "font_bold": tk.StringVar(),
             "min_font_scale": tk.DoubleVar(), "max_font_scale": tk.DoubleVar(), "char_spacing": tk.DoubleVar(),
@@ -281,6 +292,26 @@ class App:
             sp.grid(row=i, column=1, sticky="w", padx=8)
             self.setting_widgets.append(sp)
         i = len(rows)
+        ttk.Label(w, text="提示快取").grid(row=i, column=0, sticky="w", pady=2)
+        cf = ttk.Frame(w)
+        cf.grid(row=i, column=1, sticky="w", padx=8)
+        cb = ttk.Combobox(cf, textvariable=self.v["prompt_cache"], values=["5m", "1h", "off"],
+                          state="readonly", width=6)
+        cb.pack(side="left")
+        ttk.Label(cf, text="5m = 連續翻譯最省（預設）；1h = 常暫停超過 5 分鐘時；off = 關閉",
+                  foreground="#666").pack(side="left", padx=8)
+        self.setting_widgets.append(cb)
+        i += 1
+        ttk.Label(w, text="Anthropic 呼叫方式").grid(row=i, column=0, sticky="w", pady=2)
+        af = ttk.Frame(w)
+        af.grid(row=i, column=1, sticky="w", padx=8)
+        cb = ttk.Combobox(af, textvariable=self.v["api_mode"], values=["realtime", "batch"],
+                          state="readonly", width=9)
+        cb.pack(side="left")
+        ttk.Label(af, text="batch = Message Batches 半價；每輪結果通常一小時內回來，不即時",
+                  foreground="#666").pack(side="left", padx=8)
+        self.setting_widgets.append(cb)
+        i += 1
         ck = ttk.Checkbutton(w, text="啟用多步驟翻譯檢查（每頁翻完後由檢查模型判定，否決段落退回翻譯模型修復）",
                              variable=self.v["enable_check"])
         ck.grid(row=i, column=0, columnspan=2, sticky="w", pady=(8, 2))
@@ -289,9 +320,12 @@ class App:
         ck2.grid(row=i + 1, column=0, columnspan=2, sticky="w", pady=2)
         ttk.Label(w, text="暫停後可修改這裡與模型設定，按「繼續」立即套用。\n"
                           "批次並行時，總請求數最多為「同時處理書本數 × 每本書最大並發請求數」；"
-                          "遇到速率限制（429）時先調低書本數。",
-                  foreground="#666", justify="left").grid(row=i + 2, column=0, columnspan=2, sticky="w",
-                                                         pady=(10, 0))
+                          "遇到速率限制（429）時先調低書本數。\n"
+                          "提示快取：系統提示與整頁原文各為一層快取；同一頁的多個批次會讓第一個請求先寫入快取，"
+                          "其餘等它開始回應後再讀取，避免重複寫入。Anthropic、OpenAI、OpenRouter、DeepSeek 皆適用"
+                          "（依服務自動選擇標記方式與路由）。",
+                  foreground="#666", justify="left", wraplength=760).grid(row=i + 2, column=0, columnspan=2,
+                                                                          sticky="w", pady=(10, 0))
         self.setting_widgets += [ck, ck2]
 
         # --- layout tab ---
@@ -621,10 +655,7 @@ class App:
                     self.progress.config(maximum=max(1, ev["total"]), value=ev["done"])
                     u = ev["usage"]
                     tr, ck = u["translator"], u["checker"]
-                    self.lbl_usage.config(text=(
-                        f"翻譯：{tr['requests']} 次請求，輸入 {tr['input_tokens']:,}（快取 {tr['cache_read_tokens']:,}）"
-                        f" / 輸出 {tr['output_tokens']:,} tokens    "
-                        f"檢查：{ck['requests']} 次請求，輸入 {ck['input_tokens']:,} / 輸出 {ck['output_tokens']:,} tokens"))
+                    self.lbl_usage.config(text=f"翻譯：{_usage_text(tr)}    檢查：{_usage_text(ck)}")
                     self._progress_text = f"頁面 {ev['done']}/{ev['total']}" + (
                         f"，失敗 {ev['error']}" if ev["error"] else "")
                     self._refresh_status()

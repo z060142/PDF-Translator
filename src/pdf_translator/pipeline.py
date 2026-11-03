@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import os
@@ -15,7 +16,8 @@ from typing import Callable
 import pymupdf
 
 from .config import WORK_DIR, Settings, resolve_fonts
-from .llm import LLMClient, LLMError, Prompt, RetryableError, Usage
+from .llm import LLMClient, LLMError, Prompt, RetryableError, Usage, cache_saving
+from .prompt_cache import CacheCoordinator
 from .layout_rules import learn, length_limits, summary, target_char_em, unit_fit
 from .markup import normalize_translation, plain, rules_for
 from .pdf_layout import FontPair, extract_units, render_document
@@ -186,6 +188,7 @@ class Job:
         self.usage = {"translator": Usage(), "checker": Usage()}
         self.paused = False
         self._clients: dict[str, LLMClient] = {}
+        self._cache = CacheCoordinator()      # prompt-cache layers shared by all requests of this job
         self._all_clients: list[LLMClient] = []
         self._last_save = 0.0
         self._save_pending = False
@@ -290,10 +293,15 @@ class Job:
         for c in self._all_clients:
             await c.close()
 
+    def _is_batch(self, role: str) -> bool:
+        """Requests of this role go through the Message Batches API (Anthropic only)."""
+        return self.settings.api_mode == "batch" and getattr(self.settings, role).provider == "anthropic"
+
     def _client(self, role: str) -> LLMClient:
         c = self._clients.get(role)
         if c is None:
-            c = LLMClient(getattr(self.settings, role))
+            c = LLMClient(getattr(self.settings, role), self.settings.prompt_cache, self._cache,
+                          batch=self._is_batch(role), log=self.log, role=role)
             self._clients[role] = c
             self._all_clients.append(c)
         return c
@@ -325,7 +333,9 @@ class Job:
         self._fonts = make_fonts(s)
         self._rules: dict = {"scales": {}, "counts": {}, "ratio": None}
         self._rules_text = ""
-        self._page_limiter = DynamicLimiter(lambda: self.settings.page_concurrency)
+        # batch mode: every page joins the current round, so one batch carries the whole document
+        self._page_limiter = DynamicLimiter(
+            lambda: 10 ** 6 if self._is_batch("translator") else self.settings.page_concurrency)
         self.ready.set()
 
         if not s.input_pdf or not Path(s.input_pdf).exists():
@@ -368,6 +378,9 @@ class Job:
         done = sum(1 for p in pages if st["pages"][str(p)]["status"] == "done")
         self._pages = pages
         self.log(f"工作目錄: {wd}")
+        if any(self._is_batch(r) for r in ("translator", "checker")):
+            self.log("批次模式：Anthropic 請求以 Message Batches 送出（5 折），每一輪（翻譯、檢查、修復）"
+                     "各為一批，結果通常在一小時內回來；停止時會取消尚未完成的批次。")
         if done:
             self.log(f"從中斷處恢復：{done}/{len(pages)} 頁已完成。")
         self.emit({"type": "state", "state": "running"})
@@ -378,6 +391,7 @@ class Job:
         await asyncio.gather(*self._tasks, return_exceptions=True)
         self._save(force=True)
 
+        self._log_cache_summary()
         if self._stopping:
             self.result.update(status="stopped", message="已停止（進度已保存）")
             self.emit({"type": "state", "state": "stopped"})
@@ -401,6 +415,18 @@ class Job:
         self.result.update(status="failed" if not rendered else "partial" if failed else "done",
                            message="；".join(notes), failed_pages=failed, warn_pages=warn_pages)
         self.emit({"type": "state", "state": "finished"})
+
+    def _log_cache_summary(self) -> None:
+        parts = []
+        for role, name in (("translator", "翻譯"), ("checker", "檢查")):
+            u = vars(self.usage[role])
+            saving = cache_saving(u)
+            if saving is not None:
+                parts.append(f"{name} 讀取 {u['cache_read_tokens']:,}、寫入 {u['cache_write_tokens']:,} tokens，"
+                             f"輸入成本省下約 {saving:.0%}")
+        if parts:
+            waits = f"；{self._cache.waits} 個請求改為等待快取寫好再讀取" if self._cache.waits else ""
+            self.log("提示快取：" + "；".join(parts) + waits)
 
     async def _render(self, label: str, settings: Settings | None = None) -> bool:
         settings = settings or self.settings
@@ -435,7 +461,8 @@ class Job:
             await self._gate.wait()
             if self._stopping:
                 raise asyncio.CancelledError
-            async with self._limiter:
+            # batch requests wait for their batch, not for a connection: no request limit for them
+            async with (contextlib.nullcontext() if self._is_batch(role) else self._limiter):
                 await self._gate.wait()
                 if self._stopping:
                     raise asyncio.CancelledError
@@ -518,8 +545,12 @@ class Job:
             got.add(uid)
         return wanted - got, problems
 
+    def _translatable_ids(self, pno: int) -> set[str]:
+        return {u["id"] for u in self.state["pages"][str(pno)]["units"] if not u["skip"]}
+
     async def _translate_ids(self, pno: int, ids: list[str], task_header: str, label: str,
-                             extra: str = "") -> list[str]:
+                             extra: str = "", reuse: int = 1) -> list[str]:
+        """reuse: requests of this round sharing the page context (decides the cache write)."""
         page = self.state["pages"][str(pno)]
         by_id = {u["id"]: u for u in page["units"]}
         missing = list(ids)
@@ -528,15 +559,23 @@ class Job:
             segs = [by_id[i] for i in missing]
             final = attempt == 1
 
-            def make_prompt(segs=segs, feedback=feedback) -> Prompt:
-                task = (f"{task_header}\n{extra}"
+            # the request covers the whole page: its segments already are the page text, so the
+            # separate page context would only repeat them (it is sent only for partial requests)
+            whole_page = {u["id"] for u in segs} >= self._translatable_ids(pno)
+
+            def make_prompt(segs=segs, feedback=feedback, whole_page=whole_page) -> Prompt:
+                note = (f"These segments are the complete text of page {pno + 1} "
+                        f"(of {self.state['page_count']}).\n" if whole_page else "")
+                task = (f"{task_header}\n{extra}{note}"
                         f"Segments to translate into {self.settings.target_lang}:\n"
                         f"{_seg_lines(segs, as_plain=not self.settings.inline_markup)}\n\n"
                         f"{self._markup_rules(segs)}{feedback}"
                         f"{self._limits_text(segs)}"
                         'Return JSON {"translations": [{"id": "S#", "text": "..."}]} containing exactly '
                         f"these ids: {', '.join(u['id'] for u in segs)}")
-                return Prompt(self._translator_system(), self._page_context(pno), task, TRANSLATION_SCHEMA)
+                context = "" if whole_page else self._page_context(pno)
+                return Prompt(self._translator_system(), context, task, TRANSLATION_SCHEMA, reuse=reuse,
+                              cache_group=str(pno))
 
             data = await self._call("translator", make_prompt, label)
             left, problems = self._apply_translations(by_id, data, set(missing), accept_bad_markup=final)
@@ -613,7 +652,8 @@ class Job:
                     f"\n\n{segs_txt}\n\n{self._markup_rules([u for u, _ in over])}"
                     'Return JSON {"translations": [{"id": "S#", "text": "..."}]} containing exactly these ids: '
                     + ", ".join(by_id))
-            return Prompt(self._translator_system(), self._page_context(pno), task, TRANSLATION_SCHEMA)
+            return Prompt(self._translator_system(), self._page_context(pno), task, TRANSLATION_SCHEMA,
+                          cache_group=str(pno))
 
         data = await self._call("translator", make_prompt, f"第 {pno + 1} 頁 精簡")
         shorter = 0
@@ -679,14 +719,11 @@ class Job:
         if page["status"] in ("pending", "error", "translating"):
             page["error"] = None
             self._set_status(pno, "translating")
-            jobs = []
-            for b in range(1, nb + 1):
-                ids = [u["id"] for u in todo if u["batch"] == b and not u.get("translation")]
-                if ids:
-                    jobs.append(self._translate_ids(
-                        pno, ids, f"Translate batch {b}/{nb} of page {pno + 1}.",
-                        f"第 {pno + 1} 頁 批次 {b}/{nb}"))
-            results = await asyncio.gather(*jobs)
+            pending = [(b, ids) for b in range(1, nb + 1)
+                       if (ids := [u["id"] for u in todo if u["batch"] == b and not u.get("translation")])]
+            results = await asyncio.gather(*(self._translate_ids(
+                pno, ids, f"Translate batch {b}/{nb} of page {pno + 1}.",
+                f"第 {pno + 1} 頁 批次 {b}/{nb}", reuse=len(pending)) for b, ids in pending))
             missing = [m for r in results for m in r]
             if missing:
                 raise RuntimeError(f"模型未回傳段落 {missing}")
@@ -713,7 +750,7 @@ class Job:
                 self.log(f"第 {pno + 1} 頁 第 {page['fix_rounds']} 輪修復: " +
                          "; ".join(f"{r['start']}-{r['end']} {r.get('reason', '')}".strip() for r in rejected),
                          "warn")
-                await asyncio.gather(*(self._fix_range(pno, r) for r in rejected))
+                await asyncio.gather(*(self._fix_range(pno, r, len(rejected)) for r in rejected))
                 self._save()
         self._relearn()
         self._set_status(pno, "done")
@@ -742,7 +779,7 @@ class Job:
         def make_prompt() -> Prompt:
             task = (f"<translation page=\"{pno + 1}\">\n{_by_batch(units, 'translation')}\n</translation>\n\n"
                     "Does the translation match the source? Answer with the JSON verdict.")
-            return Prompt(system, context, task, check_schema(s.check_with_reason))
+            return Prompt(system, context, task, check_schema(s.check_with_reason), cache_group=str(pno))
 
         data = await self._call("checker", make_prompt, f"第 {pno + 1} 頁檢查")
         if data.get("pass") is True and not data.get("rejected"):
@@ -772,7 +809,7 @@ class Job:
         return [{"start": units[a]["id"], "end": units[b]["id"], "reason": reason,
                  "ids": [u["id"] for u in units[a:b + 1]]} for a, b, reason in merged]
 
-    async def _fix_range(self, pno: int, r: dict) -> None:
+    async def _fix_range(self, pno: int, r: dict, reuse: int = 1) -> None:
         page = self.state["pages"][str(pno)]
         by_id = {u["id"]: u for u in page["units"]}
         segs = [by_id[i] for i in r["ids"]]
@@ -781,6 +818,6 @@ class Job:
                  + f"\nRejected translation:\n{_seg_lines(segs, 'translation')}\n"
                  "Re-translate ONLY these segments and fix the problem.\n\n")
         missing = await self._translate_ids(pno, r["ids"], f"Fix the translation of page {pno + 1}.",
-                                            f"第 {pno + 1} 頁 修復 {r['start']}-{r['end']}", extra)
+                                            f"第 {pno + 1} 頁 修復 {r['start']}-{r['end']}", extra, reuse)
         if missing:
             self.log(f"第 {pno + 1} 頁修復時缺少 {missing}，保留原翻譯", "warn")
