@@ -15,7 +15,7 @@ from collections import defaultdict
 from typing import Iterable
 
 from .markup import plain
-from .pdf_layout import FontPair, capacity_chars, fit_scale, prepare, style_key
+from .pdf_layout import LIST_RE, FontPair, capacity_chars, fit_scale, prepare, style_key
 
 CLASS_PERCENTILE = 0.2      # 80% of a class fits at the class scale without extra shrinking
 MIN_RATIO_SAMPLES = 10
@@ -41,7 +41,7 @@ def unit_fit(u: dict, fonts: FontPair, lo: float, hi: float) -> float:
     """Fit scale of a translated unit, cached in the unit (invalidated by text/font/limits)."""
     text = u["translation"].strip()
     marks = ",".join(u.get("marks") or ())
-    key = hashlib.md5(f"{fonts.signature}|{lo:.3f}|{hi:.3f}|{marks}|{u.get('italic')}|{text}"
+    key = hashlib.md5(f"{fonts.signature}|{lo:.3f}|{hi:.3f}|{marks}|{u.get('italic')}|{u.get('indent_em', 0)}|{text}"
                       .encode("utf-8")).hexdigest()[:16]
     if u.get("fit_key") != key:
         u["fit"] = round(fit_scale(u, prepare(u, text, fonts), lo, hi, fonts.spacing), 4)
@@ -49,7 +49,35 @@ def unit_fit(u: dict, fonts: FontPair, lo: float, hi: float) -> float:
     return u["fit"]
 
 
-def learn(units_lists: Iterable[list[dict]], fonts: FontPair, min_scale: float, max_scale: float) -> dict:
+def mark_body_indent(units_lists: Iterable[list[dict]], indent_em: float) -> None:
+    """Give body-text paragraphs a first-line indent of indent_em (stored as unit["indent_em"]).
+
+    Body text = the style class (size + bold) holding the most source characters. Only left-aligned
+    multi-line paragraphs of that class qualify; list items, hanging indents, centred / right
+    aligned text, headings, captions and single lines are left alone.
+    """
+    lists = [l for l in units_lists]
+    chars: dict[str, int] = defaultdict(int)
+    for units in lists:
+        for u in units:
+            u.pop("indent_em", None)
+            if not u.get("skip") and "bbox" in u:
+                chars[style_key(u)] += len(plain(u, "text"))
+    if indent_em <= 0 or not chars:
+        return
+    body = max(chars, key=chars.get)
+    for units in lists:
+        for u in units:
+            if (not u.get("skip") and "bbox" in u and style_key(u) == body and u["align"] == "left"
+                    and u["pitch"] is not None and not u.get("hang")
+                    and not LIST_RE.match(plain(u, "text").strip())):
+                u["indent_em"] = indent_em
+
+
+def learn(units_lists: Iterable[list[dict]], fonts: FontPair, min_scale: float, max_scale: float,
+          indent_em: float = 0.0) -> dict:
+    units_lists = list(units_lists)
+    mark_body_indent(units_lists, indent_em)
     samples: dict[str, list[float]] = defaultdict(list)
     ratios: list[float] = []
     for units in units_lists:

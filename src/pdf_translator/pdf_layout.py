@@ -634,11 +634,16 @@ def _geometry(u: dict) -> tuple[float, float, float, float]:
     return width, pitch0, asc, avail
 
 
+def first_indent(u: dict, s: float) -> float:
+    """First-line x offset at font size s: the source indent, or the body-text indent if larger."""
+    return max(u["indent"], u.get("indent_em", 0.0) * s)
+
+
 def _try_scale(u: dict, rt: Rich, scale: float, cs: float = 0.0) -> tuple[bool, list[list[int]]]:
     width, pitch0, asc, avail = _geometry(u)
     s = u["size"] * scale
     if u["align"] == "left":
-        lines = _wrap(rt, s, width - u.get("hang", 0.0), width - u["indent"], cs)
+        lines = _wrap(rt, s, width - u.get("hang", 0.0), width - first_indent(u, s), cs)
     else:
         lines = _wrap(rt, s, width, cs=cs)
     need = asc * scale + (len(lines) - 1) * pitch0 * scale + 0.2 * s
@@ -667,7 +672,7 @@ def capacity_chars(u: dict, scale: float, char_em: float) -> int:
     s = u["size"] * scale
     n_lines = max(1, int((avail - asc * scale - 0.2 * s) / (pitch0 * scale)) + 1)
     per_line = width / (char_em * s)
-    return max(1, int(n_lines * per_line - (u["indent"] + u.get("hang", 0.0) * (n_lines - 1)) / (char_em * s)))
+    return max(1, int(n_lines * per_line - (first_indent(u, s) + u.get("hang", 0.0) * (n_lines - 1)) / (char_em * s)))
 
 
 def style_key(u: dict) -> str:
@@ -817,7 +822,7 @@ def render_page(page: pymupdf.Page, units: list[dict], fonts: FontPair, min_scal
                 lw = _measure(rt, line, s, cs)
                 left = x0
                 if u["align"] == "left":
-                    left += u["indent"] if i == 0 else u.get("hang", 0.0)
+                    left += first_indent(u, s) if i == 0 else u.get("hang", 0.0)
                 avail_w = x1 - left
                 if u["align"] == "center":
                     x = x0 + (width - lw) / 2

@@ -43,6 +43,8 @@ def main() -> None:
     ap.add_argument("--relayout", action="store_true",
                     help="re-layout saved translations with the current font/spacing/scale settings (no API calls)")
     ap.add_argument("--font", default=None, help="font preset name (see config.FONT_PRESETS)")
+    ap.add_argument("--indent", type=float, default=None,
+                    help="first-line indent of body-text paragraphs in em (0 = off)")
     ap.add_argument("--spacing", type=float, default=None, help="letter spacing in em")
     ap.add_argument("--min-scale", type=float, default=None)
     ap.add_argument("--max-scale", type=float, default=None)
@@ -66,7 +68,7 @@ def main() -> None:
         s.target_lang = args.target
     if args.no_check:
         s.enable_check = False
-    for attr, val in (("font_preset", args.font), ("char_spacing", args.spacing),
+    for attr, val in (("font_preset", args.font), ("char_spacing", args.spacing), ("first_line_indent", args.indent),
                       ("min_font_scale", args.min_scale), ("max_font_scale", args.max_scale),
                       ("file_concurrency", args.book_concurrency), ("page_concurrency", args.page_concurrency),
                       ("request_concurrency", args.request_concurrency), ("prompt_cache", args.cache),

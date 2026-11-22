@@ -122,10 +122,12 @@ def render_from_state(settings: Settings, state: dict, out_path: str) -> tuple[d
     """
     pages_units = {int(k): v["units"] for k, v in state["pages"].items()}
     if is_epub(state["source"]):        # reflowable text: no layout fitting, text goes back into the XHTML
-        stats = epub_doc.render_document(state["source"], out_path, pages_units, settings.inline_markup)
+        stats = epub_doc.render_document(state["source"], out_path, pages_units, settings.inline_markup,
+                                         settings.first_line_indent)
         return {"scales": {}, "counts": {}, "ratio": None}, stats
     fonts = make_fonts(settings)
-    rules = learn(pages_units.values(), fonts, settings.min_font_scale, settings.max_font_scale)
+    rules = learn(pages_units.values(), fonts, settings.min_font_scale, settings.max_font_scale,
+                  settings.first_line_indent)
     stats = render_document(state["source"], out_path, pages_units, fonts, settings.min_font_scale,
                             rules["scales"], settings.max_font_scale)
     return rules, stats
@@ -618,7 +620,7 @@ class Job:
         if is_epub(self.state.get("source", "")):
             return                       # reflowable: no space limits / style scales to learn
         self._rules = learn((p["units"] for p in self.state["pages"].values()), self._fonts,
-                            s.min_font_scale, s.max_font_scale)
+                            s.min_font_scale, s.max_font_scale, s.first_line_indent)
         self.state["layout_rules"] = self._rules
         text = summary(self._rules)
         if text and text != self._rules_text:

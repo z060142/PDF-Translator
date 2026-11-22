@@ -14,7 +14,8 @@ from urllib.parse import unquote
 
 from lxml import etree
 
-from .markup import NEST_ORDER, styled_text, to_markup
+from .markup import NEST_ORDER, plain, styled_text, to_markup
+from .pdf_layout import LIST_RE
 
 _CONTAINER = "META-INF/container.xml"
 _OPF_NS = "{http://www.idpf.org/2007/opf}"
@@ -212,8 +213,20 @@ def _write_unit(el, u: dict, markup: bool) -> None:
             append_text(parent, ch)
 
 
+def epub_has_list_mark(u: dict) -> bool:
+    return bool(LIST_RE.match(plain(u, "translation").strip()))
+
+
+def _set_indent(el, em: float) -> None:
+    """Body paragraph first-line indent as an inline style (overrides the book's CSS)."""
+    rules = [r for r in (el.get("style") or "").split(";")
+             if r.strip() and not r.strip().lower().startswith("text-indent")]
+    rules.append(f"text-indent: {em:g}em")
+    el.set("style", "; ".join(r.strip() for r in rules))
+
+
 def render_document(src_path: str, out_path: str, pages_units: dict[int, list[dict]],
-                    markup: bool = True, target_lang: str = "") -> dict:
+                    markup: bool = True, indent_em: float = 0.0) -> dict:
     total = {"units": 0, "shrunk": 0, "condensed": 0}
     with zipfile.ZipFile(src_path) as zin:
         docs = spine_docs(zin)
@@ -231,6 +244,8 @@ def render_document(src_path: str, out_path: str, pages_units: dict[int, list[di
                 if not found:
                     continue
                 _write_unit(found[0], u, markup)
+                if indent_em > 0 and u.get("tag") == "p" and not epub_has_list_mark(u):
+                    _set_indent(found[0], indent_em)
                 total["units"] += 1
             replaced[name] = etree.tostring(tree, xml_declaration=True, encoding="utf-8")
         with zipfile.ZipFile(out_path, "w") as zout:

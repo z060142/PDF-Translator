@@ -159,6 +159,7 @@ class App:
             "enable_check": tk.BooleanVar(), "max_check_rounds": tk.IntVar(), "check_with_reason": tk.BooleanVar(),
             "font_preset": tk.StringVar(), "font_regular": tk.StringVar(), "font_bold": tk.StringVar(),
             "min_font_scale": tk.DoubleVar(), "max_font_scale": tk.DoubleVar(), "char_spacing": tk.DoubleVar(),
+            "first_line_indent": tk.DoubleVar(),
             "length_hints": tk.BooleanVar(), "shorten_overflow": tk.BooleanVar(), "inline_markup": tk.BooleanVar(),
             "batch_output_dir": tk.StringVar(), "batch_suffix": tk.StringVar(), "batch_recursive": tk.BooleanVar(),
             "batch_skip_existing": tk.BooleanVar(),
@@ -357,22 +358,26 @@ class App:
         sp = ttk.Spinbox(t, from_=-0.2, to=0.5, increment=0.01, textvariable=self.v["char_spacing"], width=8)
         sp.grid(row=6, column=1, sticky="w")
         self.setting_widgets.append(sp)
+        ttk.Label(t, text="內文首行縮排（em，0＝關閉；只套用在一般內文段落，例如 2）").grid(row=7, column=0, sticky="w")
+        sp = ttk.Spinbox(t, from_=0.0, to=4.0, increment=0.5, textvariable=self.v["first_line_indent"], width=8)
+        sp.grid(row=7, column=1, sticky="w")
+        self.setting_widgets.append(sp)
         ck1 = ttk.Checkbutton(t, text="動態學習版面規則：依文件累積的譯文/原文長度比，提示翻譯模型版面容量",
                               variable=self.v["length_hints"])
-        ck1.grid(row=7, column=0, columnspan=3, sticky="w", pady=(8, 2))
+        ck1.grid(row=8, column=0, columnspan=3, sticky="w", pady=(8, 2))
         ck2 = ttk.Checkbutton(t, text="譯文超出原版面時，先要求翻譯模型精簡（每段最多一次，在檢查之前）",
                               variable=self.v["shorten_overflow"])
-        ck2.grid(row=8, column=0, columnspan=3, sticky="w", pady=2)
+        ck2.grid(row=9, column=0, columnspan=3, sticky="w", pady=2)
         ck3 = ttk.Checkbutton(t, text="保留行內格式：粗體、斜體、底線、刪除線、螢光標記、上下標以 Markdown 標記送給翻譯模型，"
                                       "譯文須保留相同標記（翻譯中不可更改；關閉時重新排版會輸出純文字）",
                               variable=self.v["inline_markup"])
-        ck3.grid(row=9, column=0, columnspan=3, sticky="w", pady=2)
+        ck3.grid(row=10, column=0, columnspan=3, sticky="w", pady=2)
         self.doc_widgets.append(ck3)
         ttk.Label(t, text="同一樣式（原字級＋粗細）的文字在全文件使用同一縮放比例，由已翻譯的頁面自動學習；"
                           "輸出時以全文件規則重新排版，各頁字級一致。\n"
                           "翻譯完成後若只想改字型、字距或縮放：修改本頁設定後按「重新排版輸出」，"
                           "會用已保存的譯文重新學習規則並輸出，不呼叫 API。暫停中也可以先按它預覽。",
-                  foreground="#666", wraplength=760, justify="left").grid(row=10, column=0, columnspan=3,
+                  foreground="#666", wraplength=760, justify="left").grid(row=11, column=0, columnspan=3,
                                                                           sticky="w", pady=(6, 0))
         self.setting_widgets += [ck1, ck2]
         t.columnconfigure(1, weight=1)

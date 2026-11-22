@@ -70,6 +70,7 @@ class Settings:
     min_font_scale: float = 0.6            # smallest allowed shrink when text overflows
     max_font_scale: float = 1.0            # >1 lets short translations grow to fill their box
     char_spacing: float = 0.0              # extra letter spacing in em (negative = tighter)
+    first_line_indent: float = 0.0         # first-line indent of body-text paragraphs, in em (0 = off)
     length_hints: bool = True              # tell the translator the space limit of tight segments
     shorten_overflow: bool = True          # ask for a concise rewrite of segments that overflow
     inline_markup: bool = True             # carry inline styles through translation as Markdown markers
