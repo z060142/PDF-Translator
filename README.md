@@ -56,6 +56,11 @@
   - `anthropic`：Claude（預設翻譯 `claude-opus-5-5`、檢查 `claude-sonnet-5-5`），思考程度 `low`～`max`。
   - `openai`：任何相容 OpenAI Chat Completions 的服務，填 Base URL 即可（OpenAI、DeepSeek、OpenRouter、本地 vLLM/Ollama 等），思考程度會以 `reasoning_effort` 傳送。
 
+- **EPUB 翻譯**：輸入 `.epub` 時，每個章節（spine 中的 XHTML 檔）視為一「頁」，段落、標題、清單項目、表格儲存格等區塊元素各為一段。翻譯、檢查、修復、中斷恢復、批次處理都與 PDF 相同，輸出為 `<檔名>_translated.epub`。
+  - 行內格式（`b/strong`、`i/em`、`u`、`s/del`、`mark`、`sup`、`sub`）以同一套標記送翻，輸出時寫回對應標籤；`<br/>` 會保留，段內的圖片等無文字元素保留在段首。
+  - 因為 EPUB 是流式排版，不做字級縮放、版面容量提示與精簡；字型、CSS、圖片、目錄等其他檔案原樣複製。
+  - 限制：段內含文字的連結（`<a>`）、`<span>` 等標籤在譯文中只保留文字；與區塊元素混在同一層的零散文字不翻譯。
+
 ## 安裝
 
 需要 [uv](https://docs.astral.sh/uv/)：

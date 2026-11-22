@@ -464,13 +464,15 @@ class App:
 
     # ------------------------------------------------------------------ actions
     def _browse_input(self) -> None:
-        p = filedialog.askopenfilename(filetypes=[("PDF", "*.pdf")])
+        p = filedialog.askopenfilename(filetypes=[("PDF / EPUB", "*.pdf *.epub"), ("PDF", "*.pdf"), ("EPUB", "*.epub")])
         if p:
             self.v["input_pdf"].set(p)
             self.v["output_pdf"].set(default_output_path(p))
 
     def _browse_output(self) -> None:
-        p = filedialog.asksaveasfilename(defaultextension=".pdf", filetypes=[("PDF", "*.pdf")])
+        p = filedialog.asksaveasfilename(
+            defaultextension=Path(self.v["input_pdf"].get()).suffix or ".pdf",
+            filetypes=[("PDF / EPUB", "*.pdf *.epub"), ("PDF", "*.pdf"), ("EPUB", "*.epub")])
         if p:
             self.v["output_pdf"].set(p)
 
@@ -520,11 +522,11 @@ class App:
         self._refresh_batch_tree()
         self._collect()
         if not new:
-            self._append_log("沒有新增任何 PDF（已在清單中，或資料夾內沒有 PDF；檔名以輸出後綴或 _translated "
+            self._append_log("沒有新增任何 PDF/EPUB（已在清單中，或資料夾內沒有 PDF/EPUB；檔名以輸出後綴或 _translated "
                              "結尾的檔案會被視為先前的輸出而略過）。", "warn")
 
     def _batch_add_files(self) -> None:
-        ps = filedialog.askopenfilenames(filetypes=[("PDF", "*.pdf")])
+        ps = filedialog.askopenfilenames(filetypes=[("PDF / EPUB", "*.pdf *.epub"), ("PDF", "*.pdf"), ("EPUB", "*.epub")])
         if ps:
             self._batch_add(list(ps))
 

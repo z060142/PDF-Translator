@@ -19,6 +19,7 @@ from typing import Callable, Iterable
 import pymupdf
 
 from .config import Settings
+from .epub_doc import is_epub, page_count as epub_page_count
 from .layout_rules import summary
 from .pipeline import Job, layout_report, load_state, parse_page_range, render_from_state, work_dir_for
 
@@ -54,7 +55,7 @@ def _skip_suffixes(suffix: str) -> tuple[str, ...]:
 
 
 def _is_candidate(p: Path, skip: tuple[str, ...]) -> bool:
-    return p.is_file() and p.suffix.lower() == ".pdf" and not p.stem.endswith(skip)
+    return p.is_file() and p.suffix.lower() in (".pdf", ".epub") and not p.stem.endswith(skip)
 
 
 def collect_pdfs(paths: Iterable[str], recursive: bool = False,
@@ -94,7 +95,7 @@ def collect_pdfs(paths: Iterable[str], recursive: bool = False,
 
 
 def output_name(input_pdf: str, suffix: str = OUTPUT_SUFFIX) -> str:
-    return f"{Path(input_pdf).stem}{suffix}.pdf"
+    return f"{Path(input_pdf).stem}{suffix}{'.epub' if is_epub(input_pdf) else '.pdf'}"
 
 
 def plan_outputs(inputs: list[str], output_dir: str = "", suffix: str = OUTPUT_SUFFIX) -> list[str]:
@@ -241,8 +242,12 @@ class Batch:
     def _count_pages(self) -> None:
         for i, it in enumerate(self.items):
             try:
-                with pymupdf.open(it.input_pdf) as d:
-                    self._totals[i] = len(parse_page_range(self.settings.page_range, d.page_count))
+                if is_epub(it.input_pdf):
+                    n = epub_page_count(it.input_pdf)
+                else:
+                    with pymupdf.open(it.input_pdf) as d:
+                        n = d.page_count
+                self._totals[i] = len(parse_page_range(self.settings.page_range, n))
             except Exception:
                 self._totals[i] = 0
 

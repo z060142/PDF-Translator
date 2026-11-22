@@ -20,6 +20,8 @@ from .llm import LLMClient, LLMError, Prompt, RetryableError, Usage, cache_savin
 from .prompt_cache import CacheCoordinator
 from .layout_rules import learn, length_limits, summary, target_char_em, unit_fit
 from .markup import normalize_translation, plain, rules_for
+from . import epub_doc
+from .epub_doc import is_epub
 from .pdf_layout import FontPair, extract_units, render_document
 
 STATE_VERSION = 1
@@ -95,7 +97,7 @@ def work_dir_for(pdf_path: str, target_lang: str) -> Path:
 
 def default_output_path(pdf_path: str) -> str:
     p = Path(pdf_path)
-    return str(p.with_name(f"{p.stem}_translated.pdf"))
+    return str(p.with_name(f"{p.stem}_translated{'.epub' if is_epub(pdf_path) else '.pdf'}"))
 
 
 def load_state(path: Path) -> dict | None:
@@ -118,8 +120,11 @@ def render_from_state(settings: Settings, state: dict, out_path: str) -> tuple[d
     Class scales are re-learned from the whole document with the current font / spacing /
     scale settings. Returns (rules, layout stats).
     """
-    fonts = make_fonts(settings)
     pages_units = {int(k): v["units"] for k, v in state["pages"].items()}
+    if is_epub(state["source"]):        # reflowable text: no layout fitting, text goes back into the XHTML
+        stats = epub_doc.render_document(state["source"], out_path, pages_units, settings.inline_markup)
+        return {"scales": {}, "counts": {}, "ratio": None}, stats
+    fonts = make_fonts(settings)
     rules = learn(pages_units.values(), fonts, settings.min_font_scale, settings.max_font_scale)
     stats = render_document(state["source"], out_path, pages_units, fonts, settings.min_font_scale,
                             rules["scales"], settings.max_font_scale)
@@ -351,16 +356,22 @@ class Job:
         self.settings.output_pdf = out_path
         self.result["output"] = out_path
 
-        doc = pymupdf.open(s.input_pdf)
+        epub = is_epub(s.input_pdf)
+        if epub:
+            n_pages = epub_doc.page_count(s.input_pdf)
+            doc = None
+        else:
+            doc = pymupdf.open(s.input_pdf)
+            n_pages = doc.page_count
         st = load_state(self.state_path)
         if st is None:
             st = {"version": STATE_VERSION, "source": str(Path(s.input_pdf).resolve()),
-                  "target_lang": s.target_lang, "page_count": doc.page_count, "pages": {}}
+                  "target_lang": s.target_lang, "page_count": n_pages, "pages": {}}
         else:
             st["source"] = str(Path(s.input_pdf).resolve())
         self.state = st
         try:
-            pages = parse_page_range(s.page_range, doc.page_count)
+            pages = parse_page_range(s.page_range, n_pages)
         except ValueError:
             self.log(f"頁碼範圍格式錯誤: {s.page_range!r}", "error")
             self.result["message"] = f"頁碼範圍格式錯誤: {s.page_range!r}"
@@ -369,9 +380,11 @@ class Job:
         for pno in pages:
             if str(pno) not in st["pages"]:
                 st["pages"][str(pno)] = {"status": "pending",
-                                         "units": extract_units(doc[pno], markup=s.inline_markup),
+                                         "units": (epub_doc.extract_units(s.input_pdf, pno, s.inline_markup)
+                                                   if epub else extract_units(doc[pno], markup=s.inline_markup)),
                                          "fix_rounds": 0, "warnings": [], "error": None}
-        doc.close()
+        if doc is not None:
+            doc.close()
         self._relearn()
         self._save(force=True)
 
@@ -498,7 +511,7 @@ class Job:
     def _translator_system(self) -> str:
         s = self.settings
         text = (
-            f"You are a professional translator of PDF documents. Translate from {self._src_lang()} "
+            f"You are a professional translator of {'EPUB e-books' if is_epub(s.input_pdf) else 'PDF documents'}. Translate from {self._src_lang()} "
             f"into {s.target_lang}.\n"
             "Rules:\n"
             "- Text is split into segments [S#] following the PDF layout: paragraphs, headings, table cells, "
@@ -602,6 +615,8 @@ class Job:
     # ---------- learned layout rules ----------
     def _relearn(self) -> None:
         s = self.settings
+        if is_epub(self.state.get("source", "")):
+            return                       # reflowable: no space limits / style scales to learn
         self._rules = learn((p["units"] for p in self.state["pages"].values()), self._fonts,
                             s.min_font_scale, s.max_font_scale)
         self.state["layout_rules"] = self._rules
